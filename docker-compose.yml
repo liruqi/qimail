@@ -1,0 +1,14 @@
+services:
+  qimail:
+    build: .
+    image: qimail:local
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # web app and JMAP
+      - "25:25"       # inbound SMTP (point your domain's MX here)
+    env_file: .env.docker
+    volumes:
+      - qimail-data:/data
+
+volumes:
+  qimail-data:

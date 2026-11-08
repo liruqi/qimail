@@ -1,0 +1,409 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useLanguage } from "@/components/language-provider";
+import { useCurrentUser } from "@/hooks/use-current-user";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
+
+/**
+ * Sending, from the account's point of view.
+ *
+ * Administrators never see this page: they own the switch and are never metered,
+ * so every card here (buy time, bring a key) would be an offer to sell somebody
+ * their own server. They are redirected to the first settings section instead.
+ *
+ * Two ways to qualify, drawn in the order they cost the person: the domain may
+ * already send (nothing to do), or they bring their own provider, or they buy
+ * time. The page never claims one of those is true — it renders what
+ * `/api/billing` says, and a pending order is followed until Alipay says it
+ * was paid.
+ */
+
+type SendStatus = {
+	allowed: boolean;
+	reason: "domain" | "admin" | "own" | "paid" | "free" | null;
+	admin: boolean;
+	/** The free allowance — a few messages a day out of this server's provider. */
+	free?: { limit: number; used: number; remaining: number; exhausted: boolean; nextSlotAt: string | null } | null;
+	paidUntil: string | null;
+	paidDaysLeft: number;
+	own: { provider: "resend" | "ses"; description: string } | null;
+	systemProvider: "resend" | "ses" | null;
+	/** Buying needs a provider to spend the money on and an Alipay application to take it. */
+	buyingOffered: boolean;
+	canStoreCredentials: boolean;
+	/** What a month costs, already formatted for the page. */
+	price: { cents: number; amount: string; label: string };
+	months: { min: number; max: number };
+	orders?: Order[];
+	/** Only sent to an administrator: the orders table could not be read. */
+	ordersError?: string;
+	/**
+	 * Reads that failed, by name. The answer above is then missing their
+	 * contribution — the one thing a page must not do is present that as a fact,
+	 * so what broke is listed instead of hidden behind "not enabled".
+	 */
+	problems?: Record<string, string>;
+};
+
+type Order = {
+	id: string;
+	months: number;
+	amount: string;
+	status: "pending" | "expired" | "paid";
+	createdAt: string;
+	expiresAt: string;
+	tradeNo: string | null;
+};
+
+/** Alipay speaks yuan; the page shows the same figure the cashier will. */
+const money = (amount: string) => `¥${amount}`;
+
+/**
+ * What to show when a request fails. The endpoints name the step that broke and,
+ * for an administrator, why; repeating only "could not load" leaves whoever runs
+ * this deployment with nothing to act on.
+ */
+function failureMessage(body: { error?: unknown; detail?: unknown } | null, fallback: string): string {
+	const error = typeof body?.error === "string" ? body.error : fallback;
+	return typeof body?.detail === "string" ? `${error} — ${body.detail}` : error;
+}
+
+export function SendingSettings() {
+	const { t } = useLanguage();
+	const router = useRouter();
+	const user = useCurrentUser();
+	// Unknown (null) is not "not an administrator": redirecting before the session
+	// arrives would bounce every administrator for a frame on every visit.
+	const admin = user?.role === "admin";
+	const [status, setStatus] = useState<SendStatus | null>(null);
+	const [error, setError] = useState<string | null>(null);
+	const [months, setMonths] = useState(1);
+	const [order, setOrder] = useState<Order | null>(null);
+	/** The signed cashier URL for the open order, kept so the button can reopen it. */
+	const [payUrl, setPayUrl] = useState<string | null>(null);
+	const [busy, setBusy] = useState(false);
+	const [provider, setProvider] = useState<"resend" | "ses">("resend");
+	const [fields, setFields] = useState({ apiKey: "", accessKeyId: "", secretAccessKey: "", region: "us-east-1" });
+	const pollTimer = useRef<number | null>(null);
+
+	const load = useCallback(async () => {
+		if (admin) return null;
+		const response = await fetch("/api/billing", { cache: "no-store" });
+		const body = await response.json().catch(() => null);
+		if (!response.ok) throw new Error(failureMessage(body, "Could not load sending settings"));
+		setStatus(body as SendStatus);
+		const pending = (body.orders as Order[] | undefined)?.find((item) => item.status === "pending");
+		if (pending) setOrder(pending);
+		return body as SendStatus;
+	}, [t, admin]);
+
+	useEffect(() => {
+		if (admin) router.replace("/settings/account");
+	}, [admin, router]);
+
+	useEffect(() => {
+		let cancelled = false;
+		void load().catch((cause: unknown) => {
+			if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [load]);
+
+	// A pending order is followed until it is paid or its window closes. The
+	// endpoint throttles the Alipay read, so polling here is cheap. Keyed on the
+	// id and the status rather than the object: every poll replaces the object,
+	// and an effect keyed on it would restart itself forever.
+	const orderId = order?.id ?? null;
+	const orderStatus = order?.status ?? null;
+	useEffect(() => {
+		if (!orderId || orderStatus !== "pending") {
+			if (pollTimer.current) window.clearInterval(pollTimer.current);
+			return;
+		}
+		const check = () => {
+			void fetch(`/api/billing/orders/${orderId}`, { cache: "no-store" })
+				.then((response) => response.json())
+				.then((body: { order?: Order; payUrl?: string | null }) => {
+					if (typeof body.payUrl === "string") setPayUrl(body.payUrl);
+					if (!body.order) return;
+					setOrder(body.order);
+					if (body.order.status === "paid") void load().catch(() => null);
+				})
+				.catch(() => null);
+		};
+		check();
+		pollTimer.current = window.setInterval(check, 10_000);
+		return () => {
+			if (pollTimer.current) window.clearInterval(pollTimer.current);
+		};
+	}, [orderId, orderStatus, load]);
+
+	/**
+	 * Opens an order and takes the payer to Alipay.
+	 *
+	 * The cashier opens in a new tab from a click, so no popup blocker has a say;
+	 * the order card below keeps the URL as a plain link for the case where one
+	 * still does, and this page keeps polling either way.
+	 */
+	async function buy() {
+		setBusy(true);
+		setError(null);
+		try {
+			const response = await fetch("/api/billing/orders", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ months }),
+			});
+			const body = await response.json().catch(() => null);
+			if (!response.ok) throw new Error(failureMessage(body, "Could not start the order"));
+			setOrder(body.order as Order);
+			setPayUrl(typeof body.payUrl === "string" ? body.payUrl : null);
+			if (typeof body.payUrl === "string") window.open(body.payUrl, "_blank", "noopener,noreferrer");
+		} catch (cause) {
+			setError(cause instanceof Error ? cause.message : String(cause));
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	async function saveKey(event: React.FormEvent) {
+		event.preventDefault();
+		setBusy(true);
+		setError(null);
+		try {
+			const response = await fetch("/api/billing/credentials", {
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ provider, ...fields }),
+			});
+			const body = await response.json().catch(() => null);
+			if (!response.ok) throw new Error(failureMessage(body, "Could not save the key"));
+			setStatus(body as SendStatus);
+			setFields({ apiKey: "", accessKeyId: "", secretAccessKey: "", region: "us-east-1" });
+		} catch (cause) {
+			setError(cause instanceof Error ? cause.message : String(cause));
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	async function removeKey() {
+		setBusy(true);
+		setError(null);
+		try {
+			const response = await fetch("/api/billing/credentials", { method: "DELETE" });
+			const body = await response.json().catch(() => null);
+			if (!response.ok) throw new Error(failureMessage(body, "Could not remove the key"));
+			setStatus(body as SendStatus);
+		} catch (cause) {
+			setError(cause instanceof Error ? cause.message : String(cause));
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	// One sentence for two states: "2 of 3 left" and "0 of 3 left" are the same
+	// fact read at different times, and the second is the explanation a locked
+	// page needs (the addresses are set up; the allowance is spent).
+	const freeLine =
+		status?.free && status.systemProvider
+			? t("settings.sending.statusFree", { remaining: status.free.remaining, limit: status.free.limit })
+			: null;
+
+	// Hidden, not disabled: an administrator has nothing to do here, and the nav
+	// does not offer it either (see `settings-nav-utils`).
+	if (admin) return null;
+	if (!status && !error) return <p className="py-6 text-sm text-neutral-500">{t("common.loading")}</p>;
+
+	return (
+		<div className="space-y-8">
+			<Card>
+				<CardHeader>
+					<CardTitle>{t("settings.sending.title")}</CardTitle>
+					{/* No status, no claim: saying "not enabled" next to "could not load"
+					    is two answers, one of them invented. */}
+					<CardDescription>
+						{!status
+							? null
+							: status.reason === "domain"
+								? t("settings.sending.statusDomain")
+								: status.reason === "admin"
+									? t("settings.sending.statusAdmin")
+									: status.reason === "own" && status.own
+										? t("settings.sending.statusOwn", { provider: status.own.description })
+										: status.reason === "paid" && status.paidUntil
+											? t("settings.sending.statusPaid", {
+													date: status.paidUntil.slice(0, 10),
+													days: status.paidDaysLeft,
+												})
+											: status.reason === "free" && status.free
+												? freeLine
+												: status.free?.exhausted && status.systemProvider
+													? freeLine
+													: t("settings.sending.statusLocked")}
+					</CardDescription>
+					{/* An open domain says "Included", which is true but does not say how
+					    often: the allowance line is what turns it into a number. */}
+					{status?.free && status.reason === "domain" && freeLine ? (
+						<p className="pt-1 text-xs text-neutral-500">
+							{freeLine}
+						</p>
+					) : null}
+				</CardHeader>
+				{error ? (
+					<CardContent>
+						<p className="pb-4 text-sm text-red-600">{error}</p>
+					</CardContent>
+				) : null}
+				{status?.problems ? (
+					<CardContent>
+						<p className="pb-2 text-xs font-medium text-amber-700">{t("settings.sending.problems")}</p>
+						<ul className="space-y-1 pb-4 font-mono text-xs text-neutral-500">
+							{Object.entries(status.problems).map(([stage, message]) => (
+								<li key={stage} className="break-words">
+									{stage}: {message}
+								</li>
+							))}
+						</ul>
+					</CardContent>
+				) : null}
+				{status?.ordersError ? (
+					<CardContent>
+						<p className="pb-4 text-xs text-neutral-500">{status.ordersError}</p>
+					</CardContent>
+				) : null}
+			</Card>
+
+			{status && status.reason !== "domain" && status.reason !== "admin" ? (
+				<Card id="buy" className="scroll-mt-6">
+					<CardHeader>
+						<CardTitle>{t("settings.sending.buy")}</CardTitle>
+						<CardDescription>{t("settings.sending.buyHint", { price: status.price.label })}</CardDescription>
+					</CardHeader>
+					<CardContent className="space-y-4 pb-6">
+						{status.buyingOffered ? (
+							<>
+								<div className="flex items-end gap-3">
+									<div className="space-y-2">
+										<Label htmlFor="months">{t("settings.sending.months")}</Label>
+										<Select id="months" value={months} onChange={(event) => setMonths(Number(event.target.value))}>
+											{Array.from({ length: status.months.max - status.months.min + 1 }, (_, index) => status.months.min + index).map(
+												(value) => (
+													<option key={value} value={value}>
+														{value}
+													</option>
+												),
+											)}
+										</Select>
+									</div>
+									<Button type="button" onClick={() => void buy()} disabled={busy}>
+										{t("settings.sending.buy")}
+									</Button>
+								</div>
+								{order && order.status !== "paid" ? (
+									<div className="space-y-2 rounded-lg border border-neutral-200 p-4">
+										<div className="flex flex-wrap items-center gap-2">
+											{payUrl ? (
+												<Button type="button" onClick={() => window.open(payUrl, "_blank", "noopener,noreferrer")}>
+													{t("settings.sending.pay", { amount: money(order.amount) })}
+												</Button>
+											) : (
+												<code className="rounded bg-neutral-100 px-2 py-1 text-sm">{money(order.amount)}</code>
+											)}
+											<Badge variant={order.status === "pending" ? "secondary" : "outline"}>
+												{order.status === "pending" ? t("settings.sending.waiting") : order.status}
+											</Badge>
+										</div>
+										<p className="text-xs text-neutral-500">{t("settings.sending.payWindow")}</p>
+									</div>
+								) : null}
+							</>
+						) : (
+							<p className="text-sm text-neutral-500">{t("settings.sending.notSold")}</p>
+						)}
+					</CardContent>
+				</Card>
+			) : null}
+
+			<Card id="own" className="scroll-mt-6">
+				<CardHeader>
+					<CardTitle>{t("settings.sending.ownTitle")}</CardTitle>
+					<CardDescription>{status?.own?.description ?? t("settings.sending.ownHint")}</CardDescription>
+				</CardHeader>
+				<CardContent className="pb-6">
+					{status && !status.canStoreCredentials ? (
+						<p className="text-sm text-neutral-500">{t("settings.sending.cannotStore")}</p>
+					) : (
+						<form className="space-y-3" onSubmit={(event) => void saveKey(event)}>
+							<Select value={provider} onChange={(event) => setProvider(event.target.value as "resend" | "ses")}>
+								<option value="resend">Resend</option>
+								<option value="ses">Amazon SES</option>
+							</Select>
+							{provider === "resend" ? (
+								<div className="space-y-2">
+									<Label htmlFor="apiKey">Resend API key</Label>
+									<Input
+										id="apiKey"
+										type="password"
+										autoComplete="off"
+										value={fields.apiKey}
+										onChange={(event) => setFields({ ...fields, apiKey: event.target.value })}
+										placeholder="re_..."
+									/>
+								</div>
+							) : (
+								<div className="grid gap-3 sm:grid-cols-2">
+									<div className="space-y-2">
+										<Label htmlFor="accessKeyId">Access key ID</Label>
+										<Input
+											id="accessKeyId"
+											value={fields.accessKeyId}
+											onChange={(event) => setFields({ ...fields, accessKeyId: event.target.value })}
+										/>
+									</div>
+									<div className="space-y-2">
+										<Label htmlFor="secretAccessKey">Secret access key</Label>
+										<Input
+											id="secretAccessKey"
+											type="password"
+											autoComplete="off"
+											value={fields.secretAccessKey}
+											onChange={(event) => setFields({ ...fields, secretAccessKey: event.target.value })}
+										/>
+									</div>
+									<div className="space-y-2">
+										<Label htmlFor="region">Region</Label>
+										<Input
+											id="region"
+											value={fields.region}
+											onChange={(event) => setFields({ ...fields, region: event.target.value })}
+										/>
+									</div>
+								</div>
+							)}
+							<div className="flex gap-2">
+								<Button type="submit" disabled={busy}>
+									{t("settings.sending.saveKey")}
+								</Button>
+								{status?.own ? (
+									<Button type="button" variant="ghost" onClick={() => void removeKey()} disabled={busy}>
+										{t("settings.sending.removeKey")}
+									</Button>
+								) : null}
+							</div>
+						</form>
+					)}
+				</CardContent>
+			</Card>
+		</div>
+	);
+}
