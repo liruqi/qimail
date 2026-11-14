@@ -96,6 +96,20 @@ npm run db:migrate:remote
 
 Remote migrations require the target account's `database_id` in your local `wrangler.jsonc`. Do not commit an account-specific database ID to a reusable repository.
 
+### Running Qimail next to another deployment
+
+Qimail and Mailflare can share one Cloudflare account, because every account-scoped name they
+create is prefixed: Worker `qimail`, D1 `qimail`, R2 `qimail-raw`, Queues `qimail-inbound`,
+`qimail-outbound` and `qimail-agent`, and the email routing rules target the `qimail` Worker
+(`getEmailWorkerName`). Durable Objects and rate limit namespaces are scoped to the Worker that
+declares them, so identical ids in the two projects do not collide.
+
+The database is the exception. A `database_id` identifies one database in one account, so binding
+the database Mailflare already uses would make both apps read and write the same mail, mailboxes
+and sessions. Give Qimail its own D1 database, keep its id in your local `wrangler.jsonc`, and leave
+the binding out of the repository. The same rule applies to R2 buckets and Queues if you ever point
+both apps at the same names.
+
 ## Object storage (R2, Backblaze B2 or AWS S3)
 
 Raw mail, attachments, Drive files, avatars, branding icons, JMAP uploads and backups all live in one bucket. By default that is the `BUCKET` R2 binding in `wrangler.jsonc`. To use Backblaze B2 instead, set four Worker variables (as secrets, or in `.dev.vars` locally):
