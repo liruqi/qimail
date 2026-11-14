@@ -76,7 +76,13 @@
 		{
 			"binding": "DB",
 			"database_name": "qimail",
-			"migrations_dir": "drizzle/migrations","database_id": "f33739c2-da6c-48ce-8c53-aa63d8e0fc63",
+			"migrations_dir": "drizzle/migrations",
+			// A database id belongs to one account, so it stays out of the repository.
+			// Fill in the id of the `qimail` database in your own account
+			// (`wrangler d1 create qimail` prints it, `wrangler d1 list` reads it back).
+			// Never bind a database another deployment already uses, even in the same
+			// account: both apps would then read and write the same mail.
+			// "database_id": "<id of the qimail database in your account>",
 		},
 	],
 	"r2_buckets": [
