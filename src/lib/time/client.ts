@@ -1,5 +1,7 @@
 "use client";
 
+import { clearUserTimeZoneCache } from "./utils";
+
 export const USER_TIME_ZONE_CHANGED_EVENT = "qimail:user-time-zone-changed";
 
 export function saveUserTimeZonePreference(userId: string, timeZone: string | null): void {
@@ -8,10 +10,12 @@ export function saveUserTimeZonePreference(userId: string, timeZone: string | nu
 		if (localStorage.getItem("qimail-user-time-zone") === next) return;
 		localStorage.setItem("qimail-user-time-zone", next);
 	} catch { /* Saving on the server remains authoritative. */ }
+	clearUserTimeZoneCache();
 	window.dispatchEvent(new Event(USER_TIME_ZONE_CHANGED_EVENT));
 }
 
 export function clearUserTimeZonePreference(): void {
 	try { localStorage.removeItem("qimail-user-time-zone"); }
 	catch { /* Storage is optional. */ }
+	clearUserTimeZoneCache();
 }
