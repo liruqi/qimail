@@ -5,6 +5,8 @@ export default function manifest(): MetadataRoute.Manifest {
 		name: "Qimail",
 		short_name: "Qimail",
 		description: "Email, anywhere.",
+		id: "/",
+		scope: "/",
 		start_url: "/inbox",
 		display: "standalone",
 		background_color: "#ffffff",
